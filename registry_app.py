@@ -6,15 +6,19 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, unquote
 from openpyxl import load_workbook, Workbook
 from datetime import datetime
+import re
+
+try:
+    import xlrd
+    XLRD_AVAILABLE = True
+except ImportError:
+    XLRD_AVAILABLE = False
 
 # ─── Конфиг ──────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
-
-DEFAULT_CONFIG = {
-    
-}
+DEFAULT_CONFIG = {}
 
 def load_config():
     if os.path.exists(CONFIG_PATH):
@@ -39,6 +43,53 @@ def format_date(value):
     except:
         return ""
 
+def parse_cell_addr(cell_addr):
+    """Разбирает адрес вида 'E2' -> (row_idx, col_idx) с нулевой базой для xlrd."""
+    m = re.match(r"([A-Z]+)(\d+)", cell_addr.upper())
+    if not m:
+        return None, None
+    col_str, row_str = m.group(1), m.group(2)
+    col_idx = 0
+    for ch in col_str:
+        col_idx = col_idx * 26 + (ord(ch) - ord('A') + 1)
+    return int(row_str) - 1, col_idx - 1  # 0-based
+
+def read_cell_xls(xls_sheet, cell_addr, col_type):
+    """Читает ячейку из xlrd-листа."""
+    row_idx, col_idx = parse_cell_addr(cell_addr)
+    if row_idx is None:
+        return None, "Неверный адрес ячейки"
+    try:
+        cell = xls_sheet.cell(row_idx, col_idx)
+    except IndexError:
+        return None, "Ячейка за пределами листа"
+
+    import xlrd as _xlrd
+    ctype = cell.ctype
+    val = cell.value
+
+    if ctype == _xlrd.XL_CELL_EMPTY or val == "":
+        return None, None
+
+    if col_type == "date":
+        if ctype == _xlrd.XL_CELL_DATE:
+            try:
+                dt = _xlrd.xldate_as_datetime(val, xls_sheet.book.datemode)
+                return dt.strftime("%Y-%m-%d"), None
+            except:
+                pass
+        return str(val).split(" ")[0] if val else None, None
+
+    if col_type == "number":
+        if ctype == _xlrd.XL_CELL_NUMBER:
+            return float(val), None
+        try:
+            return float(val), None
+        except:
+            return 0.0, None
+
+    return str(val) if val != "" else None, None
+
 def read_cell(sheet, cell_addr, col_type):
     try:
         val = sheet[cell_addr].value
@@ -55,42 +106,78 @@ def read_cell(sheet, cell_addr, col_type):
             return 0.0, None
     return str(val), None
 
-def build_registry(folder, config):
+def collect_excel_files(folder, recursive):
+    """Возвращает список (filepath, relative_display_name)."""
+    result = []
+    if recursive:
+        for root, dirs, files in os.walk(folder):
+            dirs.sort()
+            for filename in sorted(files):
+                if not filename.endswith((".xlsx", ".xlsm", ".xls")):
+                    continue
+                if filename == "Реестр.xlsx":
+                    continue
+                filepath = os.path.join(root, filename)
+                # Показываем путь относительно исходной папки
+                rel = os.path.relpath(filepath, folder)
+                result.append((filepath, rel))
+    else:
+        for filename in sorted(os.listdir(folder)):
+            if not filename.endswith((".xlsx", ".xlsm", ".xls")):
+                continue
+            if filename == "Реестр.xlsx":
+                continue
+            filepath = os.path.join(folder, filename)
+            result.append((filepath, filename))
+    return result
+
+def build_registry(folder, config, recursive=False):
     columns = config.get("columns", [])
     rows = []
     errors = []
 
-    for filename in sorted(os.listdir(folder)):
-        if not filename.endswith((".xlsx", ".xlsm", ".xls")):
-            continue
-        if filename == "Реестр.xlsx":
-            continue
+    excel_files = collect_excel_files(folder, recursive)
 
-        filepath = os.path.join(folder, filename)
+    for filepath, display_name in excel_files:
         try:
-            wb = load_workbook(filepath, data_only=True)
-            sheet = wb.active
-
-            row = {"_file": filename}
+            row = {"_file": display_name}
             row_errors = []
 
-            for col in columns:
-                val, err = read_cell(sheet, col["cell"].upper(), col["type"])
-                if err:
-                    row_errors.append(f'{col["name"]} ({col["cell"]}): {err}')
-                    val = None
-                if col.get("required") and (val is None or val == ""):
-                    row_errors.append(f'{col["name"]} ({col["cell"]}): пустое обязательное поле')
-                row[col["name"]] = val
+            ext = os.path.splitext(filepath.lower())[1]  # '.xls' / '.xlsx' / '.xlsm'
+            if ext == ".xls":
+                # Старый формат — читаем через xlrd
+                if not XLRD_AVAILABLE:
+                    raise ImportError("Для чтения .xls установите xlrd: pip install xlrd")
+                import xlrd as _xlrd
+                wb_xls = _xlrd.open_workbook(filepath)
+                xls_sheet = wb_xls.sheet_by_index(0)
+                for col in columns:
+                    val, err = read_cell_xls(xls_sheet, col["cell"].upper(), col["type"])
+                    if err:
+                        row_errors.append(f'{col["name"]} ({col["cell"]}): {err}')
+                        val = None
+                    if col.get("required") and (val is None or val == ""):
+                        row_errors.append(f'{col["name"]} ({col["cell"]}): пустое обязательное поле')
+                    row[col["name"]] = val
+            else:
+                # Новый формат .xlsx / .xlsm — читаем через openpyxl
+                wb = load_workbook(filepath, data_only=True)
+                sheet = wb.active
+                for col in columns:
+                    val, err = read_cell(sheet, col["cell"].upper(), col["type"])
+                    if err:
+                        row_errors.append(f'{col["name"]} ({col["cell"]}): {err}')
+                        val = None
+                    if col.get("required") and (val is None or val == ""):
+                        row_errors.append(f'{col["name"]} ({col["cell"]}): пустое обязательное поле')
+                    row[col["name"]] = val
 
             rows.append(row)
             if row_errors:
-                errors.append({"file": filename, "error": "; ".join(row_errors)})
-            else:
-                pass  # ok
+                errors.append({"file": display_name, "error": "; ".join(row_errors)})
 
         except Exception as e:
-            errors.append({"file": filename, "error": str(e)})
+            errors.append({"file": display_name, "error": str(e)})
 
     return {"rows": rows, "errors": errors, "columns": [c["name"] for c in columns]}
 
@@ -132,168 +219,182 @@ HTML = r"""<!DOCTYPE html>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Unbounded:wght@300;700&display=swap" rel="stylesheet">
 <style>
-  :root {
-    --bg: #0d0f14; --surface: #13161e; --surface2: #181c27;
-    --border: #1e2330; --accent: #00e5a0; --accent2: #00b8ff;
-    --text: #e0e6f0; --muted: #5a6480; --error: #ff4d6d;
-    --warn: #ffb547;
-    --mono: 'IBM Plex Mono', monospace;
-    --display: 'Unbounded', sans-serif;
-  }
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    background: var(--bg); color: var(--text);
-    font-family: var(--mono); font-size: 13px;
-    min-height: 100vh; overflow-x: hidden;
-  }
-  body::before {
-    content: ''; position: fixed; inset: 0;
-    background-image: linear-gradient(var(--border) 1px, transparent 1px), linear-gradient(90deg, var(--border) 1px, transparent 1px);
-    background-size: 40px 40px; opacity: .3; pointer-events: none; z-index: 0;
-  }
-  .app { position: relative; z-index: 1; max-width: 1340px; margin: 0 auto; padding: 36px 24px; }
+:root {
+  --bg: #0d0f14; --surface: #13161e; --surface2: #181c27;
+  --border: #1e2330; --accent: #00e5a0; --accent2: #00b8ff;
+  --text: #e0e6f0; --muted: #5a6480; --error: #ff4d6d;
+  --warn: #ffb547;
+  --mono: 'IBM Plex Mono', monospace;
+  --display: 'Unbounded', sans-serif;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg); color: var(--text);
+  font-family: var(--mono); font-size: 13px;
+  min-height: 100vh; overflow-x: hidden;
+}
+body::before {
+  content: ''; position: fixed; inset: 0;
+  background-image: linear-gradient(var(--border) 1px, transparent 1px), linear-gradient(90deg, var(--border) 1px, transparent 1px);
+  background-size: 40px 40px; opacity: .3; pointer-events: none; z-index: 0;
+}
+.app { position: relative; z-index: 1; max-width: 1340px; margin: 0 auto; padding: 36px 24px; }
 
-  /* ── header ── */
-  header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 28px; flex-wrap: wrap; gap: 16px; }
-  .logo { font-family: var(--display); font-weight: 700; font-size: 20px; letter-spacing: -.5px;
-    background: linear-gradient(90deg, var(--accent), var(--accent2)); -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent; background-clip: text; }
-  .logo span { font-weight: 300; }
-  .subtitle { color: var(--muted); margin-top: 4px; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
+/* ── header ── */
+header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 28px; flex-wrap: wrap; gap: 16px; }
+.logo { font-family: var(--display); font-weight: 700; font-size: 20px; letter-spacing: -.5px;
+  background: linear-gradient(90deg, var(--accent), var(--accent2)); -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent; background-clip: text; }
+.logo span { font-weight: 300; }
+.subtitle { color: var(--muted); margin-top: 4px; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
 
-  /* ── tabs ── */
-  .tabs { display: flex; gap: 2px; margin-bottom: 20px; }
-  .tab {
-    font-family: var(--display); font-size: 10px; font-weight: 700;
-    letter-spacing: .1em; text-transform: uppercase;
-    padding: 10px 20px; border: 1px solid var(--border);
-    background: transparent; color: var(--muted); cursor: pointer;
-    border-radius: 3px 3px 0 0; border-bottom: none;
-    transition: color .15s, background .15s;
-  }
-  .tab:hover { color: var(--text); }
-  .tab.active { color: var(--accent); background: var(--surface); border-color: var(--border); }
-  .tab-line { border-bottom: 1px solid var(--border); margin-bottom: 20px; }
+/* ── tabs ── */
+.tabs { display: flex; gap: 2px; margin-bottom: 20px; }
+.tab {
+  font-family: var(--display); font-size: 10px; font-weight: 700;
+  letter-spacing: .1em; text-transform: uppercase;
+  padding: 10px 20px; border: 1px solid var(--border);
+  background: transparent; color: var(--muted); cursor: pointer;
+  border-radius: 3px 3px 0 0; border-bottom: none;
+  transition: color .15s, background .15s;
+}
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--accent); background: var(--surface); border-color: var(--border); }
+.tab-line { border-bottom: 1px solid var(--border); margin-bottom: 20px; }
+.tab-content { display: none; }
+.tab-content.active { display: block; }
 
-  .tab-content { display: none; }
-  .tab-content.active { display: block; }
+/* ── panel ── */
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 20px 24px; margin-bottom: 16px; }
+.panel-label { font-family: var(--display); font-size: 10px; font-weight: 700;
+  letter-spacing: .12em; text-transform: uppercase; color: var(--accent); margin-bottom: 14px; }
 
-  /* ── panel ── */
-  .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 20px 24px; margin-bottom: 16px; }
-  .panel-label { font-family: var(--display); font-size: 10px; font-weight: 700;
-    letter-spacing: .12em; text-transform: uppercase; color: var(--accent); margin-bottom: 14px; }
+/* ── inputs ── */
+.path-row { display: flex; gap: 10px; align-items: stretch; flex-wrap: wrap; }
+input[type=text], select {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 3px;
+  color: var(--text); font-family: var(--mono); font-size: 13px;
+  padding: 9px 12px; outline: none; transition: border-color .2s;
+}
+input[type=text]:focus, select:focus { border-color: var(--accent2); }
+input[type=text]::placeholder { color: var(--muted); }
+select { cursor: pointer; }
+select option { background: var(--surface); }
 
-  /* ── inputs ── */
-  .path-row { display: flex; gap: 10px; align-items: stretch; }
-  input[type=text], select {
-    background: var(--bg); border: 1px solid var(--border); border-radius: 3px;
-    color: var(--text); font-family: var(--mono); font-size: 13px;
-    padding: 9px 12px; outline: none; transition: border-color .2s;
-  }
-  input[type=text]:focus, select:focus { border-color: var(--accent2); }
-  input[type=text]::placeholder { color: var(--muted); }
-  select { cursor: pointer; }
-  select option { background: var(--surface); }
+/* ── recursive checkbox ── */
+.recursive-wrap {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 14px; border: 1px solid var(--border); border-radius: 3px;
+  background: var(--bg); cursor: pointer; user-select: none;
+  transition: border-color .2s;
+}
+.recursive-wrap:hover { border-color: var(--accent2); }
+.recursive-wrap input[type=checkbox] {
+  accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer;
+  padding: 0; border: none; background: none;
+}
+.recursive-wrap label {
+  color: var(--muted); font-size: 12px; cursor: pointer;
+  white-space: nowrap; transition: color .2s;
+}
+.recursive-wrap:hover label { color: var(--text); }
+.recursive-wrap input[type=checkbox]:checked + label { color: var(--accent); }
 
-  .btn {
-    background: transparent; border: 1px solid var(--accent); color: var(--accent);
-    font-family: var(--mono); font-size: 12px; font-weight: 600;
-    letter-spacing: .06em; text-transform: uppercase;
-    padding: 9px 18px; border-radius: 3px; cursor: pointer;
-    transition: background .18s, color .18s; white-space: nowrap;
-  }
-  .btn:hover { background: var(--accent); color: var(--bg); }
-  .btn:disabled { opacity: .35; cursor: default; pointer-events: none; }
-  .btn.blue  { border-color: var(--accent2); color: var(--accent2); }
-  .btn.blue:hover  { background: var(--accent2); color: var(--bg); }
-  .btn.red   { border-color: var(--error); color: var(--error); }
-  .btn.red:hover   { background: var(--error); color: var(--bg); }
-  .btn.small { padding: 5px 10px; font-size: 11px; }
+.btn {
+  background: transparent; border: 1px solid var(--accent); color: var(--accent);
+  font-family: var(--mono); font-size: 12px; font-weight: 600;
+  letter-spacing: .06em; text-transform: uppercase;
+  padding: 9px 18px; border-radius: 3px; cursor: pointer;
+  transition: background .18s, color .18s; white-space: nowrap;
+}
+.btn:hover { background: var(--accent); color: var(--bg); }
+.btn:disabled { opacity: .35; cursor: default; pointer-events: none; }
+.btn.blue { border-color: var(--accent2); color: var(--accent2); }
+.btn.blue:hover { background: var(--accent2); color: var(--bg); }
+.btn.red { border-color: var(--error); color: var(--error); }
+.btn.red:hover { background: var(--error); color: var(--bg); }
+.btn.small { padding: 5px 10px; font-size: 11px; }
 
-  /* ── stats ── */
-  .stats-row { display: flex; gap: 28px; flex-wrap: wrap; }
-  .stat { display: flex; flex-direction: column; gap: 2px; }
-  .stat-value { font-family: var(--display); font-size: 22px; font-weight: 700; color: var(--accent); }
-  .stat-label { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+/* ── stats ── */
+.stats-row { display: flex; gap: 28px; flex-wrap: wrap; }
+.stat { display: flex; flex-direction: column; gap: 2px; }
+.stat-value { font-family: var(--display); font-size: 22px; font-weight: 700; color: var(--accent); }
+.stat-label { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
 
-  /* ── search ── */
-  .search-wrap { position: relative; margin-bottom: 14px; }
-  .search-icon { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: var(--muted); font-size: 14px; pointer-events: none; }
-  .search-input { width: 100%; padding: 9px 14px 9px 34px; }
+/* ── search ── */
+.search-wrap { position: relative; margin-bottom: 14px; }
+.search-icon { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: var(--muted); font-size: 14px; pointer-events: none; }
+.search-input { width: 100%; padding: 9px 14px 9px 34px; }
 
-  /* ── table ── */
-  .table-wrap { overflow-x: auto; }
-  table { width: 100%; border-collapse: collapse; }
-  thead th {
-    text-align: left; font-family: var(--display); font-size: 9px; font-weight: 700;
-    letter-spacing: .14em; text-transform: uppercase; color: var(--muted);
-    padding: 8px 10px; border-bottom: 1px solid var(--border);
-    cursor: pointer; user-select: none; white-space: nowrap;
-  }
-  thead th:hover { color: var(--text); }
-  thead th.active { color: var(--accent); }
-  tbody tr { border-bottom: 1px solid var(--border); transition: background .1s; }
-  tbody tr:hover { background: rgba(0,229,160,.04); }
-  tbody tr.has-error { background: rgba(255,77,109,.04); }
-  tbody tr:last-child { border-bottom: none; }
-  td { padding: 9px 10px; vertical-align: middle; }
-  td.file { color: var(--accent2); font-size: 12px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  td.number { text-align: right; font-weight: 600; color: var(--accent); }
-  td.date { color: var(--muted); }
-  td.empty { color: var(--error); font-size: 11px; }
-  .mark { background: rgba(0,229,160,.25); border-radius: 2px; padding: 0 1px; }
+/* ── table ── */
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+thead th {
+  text-align: left; font-family: var(--display); font-size: 9px; font-weight: 700;
+  letter-spacing: .14em; text-transform: uppercase; color: var(--muted);
+  padding: 8px 10px; border-bottom: 1px solid var(--border);
+  cursor: pointer; user-select: none; white-space: nowrap;
+}
+thead th:hover { color: var(--text); }
+thead th.active { color: var(--accent); }
+tbody tr { border-bottom: 1px solid var(--border); transition: background .1s; }
+tbody tr:hover { background: rgba(0,229,160,.04); }
+tbody tr.has-error { background: rgba(255,77,109,.04); }
+tbody tr:last-child { border-bottom: none; }
+td { padding: 9px 10px; vertical-align: middle; }
+td.file { color: var(--accent2); font-size: 12px; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+td.number { text-align: right; font-weight: 600; color: var(--accent); }
+td.date { color: var(--muted); }
+td.empty { color: var(--error); font-size: 11px; }
+.mark { background: rgba(0,229,160,.25); border-radius: 2px; padding: 0 1px; }
 
-  /* ── config table ── */
-  .cfg-table { width: 100%; border-collapse: collapse; margin-bottom: 14px; }
-  .cfg-table th {
-    text-align: left; font-family: var(--display); font-size: 9px; font-weight: 700;
-    letter-spacing: .12em; text-transform: uppercase; color: var(--muted);
-    padding: 6px 8px; border-bottom: 1px solid var(--border);
-  }
-  .cfg-table td { padding: 6px 6px; border-bottom: 1px solid rgba(30,35,48,.7); vertical-align: middle; }
-  .cfg-table tr:last-child td { border-bottom: none; }
-  .cfg-table input[type=text] { width: 100%; padding: 6px 8px; font-size: 12px; }
-  .cfg-table select { padding: 6px 8px; font-size: 12px; }
-  .cfg-table input[type=checkbox] { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
-  .drag-handle { color: var(--muted); cursor: grab; padding: 0 6px; font-size: 16px; user-select: none; }
-  .drag-handle:active { cursor: grabbing; }
-  .cfg-row.dragging { opacity: .4; }
-  .cfg-row.drag-over { border-top: 2px solid var(--accent); }
+/* ── config table ── */
+.cfg-table { width: 100%; border-collapse: collapse; margin-bottom: 14px; }
+.cfg-table th {
+  text-align: left; font-family: var(--display); font-size: 9px; font-weight: 700;
+  letter-spacing: .12em; text-transform: uppercase; color: var(--muted);
+  padding: 6px 8px; border-bottom: 1px solid var(--border);
+}
+.cfg-table td { padding: 6px 6px; border-bottom: 1px solid rgba(30,35,48,.7); vertical-align: middle; }
+.cfg-table tr:last-child td { border-bottom: none; }
+.cfg-table input[type=text] { width: 100%; padding: 6px 8px; font-size: 12px; }
+.cfg-table select { padding: 6px 8px; font-size: 12px; }
+.cfg-table input[type=checkbox] { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
+.drag-handle { color: var(--muted); cursor: grab; padding: 0 6px; font-size: 16px; user-select: none; }
+.drag-handle:active { cursor: grabbing; }
+.cfg-row.dragging { opacity: .4; }
+.cfg-row.drag-over { border-top: 2px solid var(--accent); }
 
-  /* ── errors ── */
-  .error-item { display: flex; gap: 10px; align-items: flex-start; padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
-  .error-item:last-child { border-bottom: none; }
-  .error-file { color: var(--error); min-width: 160px; }
-  .error-msg { color: var(--muted); }
+/* ── errors ── */
+.error-item { display: flex; gap: 10px; align-items: flex-start; padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
+.error-item:last-child { border-bottom: none; }
+.error-file { color: var(--error); min-width: 160px; }
+.error-msg { color: var(--muted); }
 
-  /* ── badge ── */
-  .badge { display: inline-block; background: rgba(0,229,160,.12); color: var(--accent);
-    font-size: 10px; padding: 2px 7px; border-radius: 10px; margin-left: 8px; vertical-align: middle; }
-  .badge.red { background: rgba(255,77,109,.12); color: var(--error); }
+/* ── badge ── */
+.badge { display: inline-block; background: rgba(0,229,160,.12); color: var(--accent);
+  font-size: 10px; padding: 2px 7px; border-radius: 10px; margin-left: 8px; vertical-align: middle; }
+.badge.red { background: rgba(255,77,109,.12); color: var(--error); }
 
-  /* ── toast ── */
-  #toast { position: fixed; bottom: 24px; right: 24px; background: var(--surface);
-    border: 1px solid var(--accent); color: var(--accent); font-family: var(--mono);
-    font-size: 12px; padding: 11px 18px; border-radius: 3px;
-    transform: translateY(60px); opacity: 0; transition: transform .25s, opacity .25s; z-index: 100; }
-  #toast.show { transform: translateY(0); opacity: 1; }
-  #toast.err  { border-color: var(--error); color: var(--error); }
-
-  .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--border);
-    border-top-color: var(--accent); border-radius: 50%; animation: spin .6s linear infinite; vertical-align: middle; margin-right: 5px; }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  .hidden { display: none !important; }
-
-  .add-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 4px; }
-  .add-row input[type=text] { flex: 1; min-width: 120px; }
-  .hint { font-size: 11px; color: var(--muted); margin-top: 8px; line-height: 1.6; }
-
-  .cfg-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+/* ── toast ── */
+#toast { position: fixed; bottom: 24px; right: 24px; background: var(--surface);
+  border: 1px solid var(--accent); color: var(--accent); font-family: var(--mono);
+  font-size: 12px; padding: 11px 18px; border-radius: 3px;
+  transform: translateY(60px); opacity: 0; transition: transform .25s, opacity .25s; z-index: 100; }
+#toast.show { transform: translateY(0); opacity: 1; }
+#toast.err { border-color: var(--error); color: var(--error); }
+.spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--border);
+  border-top-color: var(--accent); border-radius: 50%; animation: spin .6s linear infinite; vertical-align: middle; margin-right: 5px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.hidden { display: none !important; }
+.add-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 4px; }
+.add-row input[type=text] { flex: 1; min-width: 120px; }
+.hint { font-size: 11px; color: var(--muted); margin-top: 8px; line-height: 1.6; }
+.cfg-actions { display: flex; gap: 10px; flex-wrap: wrap; }
 </style>
 </head>
 <body>
 <div class="app">
-
   <header>
     <div>
       <div class="logo">Реестр<span>.</span>xlsx</div>
@@ -302,8 +403,8 @@ HTML = r"""<!DOCTYPE html>
   </header>
 
   <div class="tabs">
-    <button class="tab active" onclick="switchTab('registry')">▦ Реестр</button>
-    <button class="tab" onclick="switchTab('settings')">⚙ Настройки</button>
+    <button class="tab active" onclick="switchTab('registry',event)">▦ Реестр</button>
+    <button class="tab" onclick="switchTab('settings',event)">⚙ Настройки</button>
   </div>
   <div class="tab-line"></div>
 
@@ -313,7 +414,15 @@ HTML = r"""<!DOCTYPE html>
     <div class="panel">
       <div class="panel-label">Папка с документами</div>
       <div class="path-row">
-        <input id="folderPath" type="text" style="flex:1" placeholder="Например: C:\Документы\Счета или /home/user/invoices" />
+        <input id="folderPath" type="text" style="flex:1;min-width:200px"
+               placeholder="Например: C:\Документы\Счета или /home/user/invoices" />
+
+        <!-- ── Чекбокс «вложенные папки» ── -->
+        <div class="recursive-wrap" onclick="toggleRecursive()">
+          <input type="checkbox" id="recursiveCheck" onclick="event.stopPropagation()" onchange="">
+          <label for="recursiveCheck">📂 Вложенные папки</label>
+        </div>
+
         <button class="btn" id="scanBtn" onclick="scanFolder()">▶ Сканировать</button>
         <button class="btn blue" id="saveBtn" onclick="saveXlsx()" disabled>↓ Сохранить xlsx</button>
       </div>
@@ -334,7 +443,8 @@ HTML = r"""<!DOCTYPE html>
       </div>
       <div class="search-wrap">
         <span class="search-icon">⌕</span>
-        <input class="search-input" id="searchInput" type="text" placeholder="Быстрый поиск по таблице…" oninput="filterTable()">
+        <input class="search-input" id="searchInput" type="text"
+               placeholder="Быстрый поиск по таблице…" oninput="filterTable()">
       </div>
       <div class="table-wrap">
         <table>
@@ -353,7 +463,6 @@ HTML = r"""<!DOCTYPE html>
 
   <!-- ══ НАСТРОЙКИ ══ -->
   <div id="tab-settings" class="tab-content">
-
     <div class="panel">
       <div class="panel-label">Колонки реестра</div>
       <p class="hint" style="margin-bottom:14px">
@@ -374,7 +483,6 @@ HTML = r"""<!DOCTYPE html>
         </thead>
         <tbody id="cfgBody"></tbody>
       </table>
-
       <div class="add-row">
         <input type="text" id="newName" placeholder="Название" style="max-width:200px" />
         <input type="text" id="newCell" placeholder="Ячейка (E2)" style="max-width:100px;text-transform:uppercase" />
@@ -395,10 +503,9 @@ HTML = r"""<!DOCTYPE html>
       </div>
       <p class="hint" style="margin-top:10px">Настройки сохраняются в <b>config.json</b> рядом со скриптом и применяются при следующем сканировании.</p>
     </div>
-
   </div>
-
 </div>
+
 <div id="toast"></div>
 
 <script>
@@ -406,12 +513,18 @@ let allRows = [], colDefs = [], sortCol = -1, sortAsc = true;
 let dragSrc = null;
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
-function switchTab(name) {
+function switchTab(name, event) {
   document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
   document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
   event.target.classList.add('active');
   if (name === 'settings') loadSettingsUI();
+}
+
+// ── Recursive toggle ──────────────────────────────────────────────────────────
+function toggleRecursive() {
+  const cb = document.getElementById('recursiveCheck');
+  cb.checked = !cb.checked;
 }
 
 // ── Settings UI ───────────────────────────────────────────────────────────────
@@ -426,12 +539,12 @@ function renderCfgTable() {
   const body = document.getElementById('cfgBody');
   body.innerHTML = colDefs.map((c, i) => `
     <tr class="cfg-row" draggable="true" data-idx="${i}"
-      ondragstart="dragStart(event,${i})" ondragover="dragOver(event,${i})"
-      ondrop="dragDrop(event,${i})" ondragleave="dragLeave(event)">
+        ondragstart="dragStart(event,${i})" ondragover="dragOver(event,${i})"
+        ondrop="dragDrop(event,${i})" ondragleave="dragLeave(event)">
       <td><span class="drag-handle">⠿</span></td>
       <td><input type="text" value="${esc(c.name)}" oninput="colDefs[${i}].name=this.value" /></td>
       <td><input type="text" value="${esc(c.cell)}" style="text-transform:uppercase"
-            oninput="colDefs[${i}].cell=this.value.toUpperCase()" /></td>
+                 oninput="colDefs[${i}].cell=this.value.toUpperCase()" /></td>
       <td>
         <select onchange="colDefs[${i}].type=this.value">
           ${['text','date','number'].map(t => `<option value="${t}" ${c.type===t?'selected':''}>${{text:'Текст',date:'Дата',number:'Число'}[t]}</option>`).join('')}
@@ -501,19 +614,25 @@ function dragDrop(e, i) {
 async function scanFolder() {
   const path = document.getElementById('folderPath').value.trim();
   if (!path) { showToast('Укажите путь к папке', true); return; }
+
+  const recursive = document.getElementById('recursiveCheck').checked;
   const btn = document.getElementById('scanBtn');
   btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>Сканирую…';
+
   try {
-    const res = await fetch('/api/scan?path=' + encodeURIComponent(path));
+    const url = '/api/scan?path=' + encodeURIComponent(path) + '&recursive=' + (recursive ? '1' : '0');
+    const res = await fetch(url);
     const data = await res.json();
     if (data.error) { showToast(data.error, true); return; }
+
     allRows = data.rows;
     buildTableHeader(data.columns);
     filterTable();
     renderStats(data);
     renderErrors(data.errors || []);
     document.getElementById('saveBtn').disabled = false;
-    showToast('Найдено файлов: ' + data.rows.length);
+    const modeLabel = recursive ? ' (включая вложенные)' : '';
+    showToast('Найдено файлов: ' + data.rows.length + modeLabel);
   } catch(e) { showToast('Ошибка соединения', true); }
   finally { btn.disabled = false; btn.innerHTML = '▶ Сканировать'; }
 }
@@ -522,6 +641,7 @@ async function saveXlsx() {
   const path = document.getElementById('folderPath').value.trim();
   const btn = document.getElementById('saveBtn');
   btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>Сохраняю…';
+
   try {
     const res = await fetch('/api/save', {
       method: 'POST', headers: {'Content-Type':'application/json'},
@@ -547,9 +667,9 @@ function renderStats(data) {
   data.rows.forEach(r => {
     data.columns.forEach(c => { if (r[c] === null || r[c] === undefined || r[c] === '') emptyCount++; });
   });
-  document.getElementById('statFiles').textContent  = data.rows.length;
+  document.getElementById('statFiles').textContent = data.rows.length;
   document.getElementById('statErrors').textContent = (data.errors||[]).length;
-  document.getElementById('statEmpty').textContent  = emptyCount;
+  document.getElementById('statEmpty').textContent = emptyCount;
   document.getElementById('statsPanel').classList.remove('hidden');
 }
 
@@ -564,12 +684,13 @@ function renderErrors(errors) {
 }
 
 function renderTable(rows) {
-  const q = document.getElementById('searchInput').value.toLowerCase();
   document.getElementById('tablePanel').classList.remove('hidden');
-  const cols = Array.from(document.querySelectorAll('#tableHead th')).map(th => th.dataset.col);
-  const colNames = Array.from(document.querySelectorAll('#tableHead th')).map(th => th.textContent.replace(/[↕↑↓]/g,'').trim());
+  const ths = Array.from(document.querySelectorAll('#tableHead th'));
+  const colNames = ths.map(th => th.textContent.replace(/[↕↑↓]/g,'').trim());
 
   const body = document.getElementById('tableBody');
+  const q = document.getElementById('searchInput').value.toLowerCase();
+
   body.innerHTML = rows.map(r => {
     const file = r['_file'] || '';
     const cells = colNames.map(c => c === 'Файл' ? file : r[c]);
@@ -584,7 +705,7 @@ function renderTable(rows) {
         else if (col === 'Дата' || (raw && raw.match(/^\d{4}-\d{2}-\d{2}$/))) cls = 'date';
         if (isEmpty) cls += ' empty';
         const display = isEmpty ? '—' : (typeof v === 'number' ? v.toLocaleString('ru-RU', {maximumFractionDigits:2}) : raw);
-        return `<td class="${cls.trim()}">${hi(esc(display), q)}</td>`;
+        return `<td class="${cls.trim()}" title="${esc(display)}">${hi(esc(display), q)}</td>`;
       }).join('')}
     </tr>`;
   }).join('');
@@ -624,6 +745,7 @@ function hi(text, q) {
   if (idx < 0) return text;
   return text.slice(0,idx) + '<mark class="mark">' + text.slice(idx,idx+q.length) + '</mark>' + text.slice(idx+q.length);
 }
+
 function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
 let toastTimer;
@@ -647,33 +769,29 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
-
         if parsed.path in ("/", "/index.html"):
             self._html(HTML)
-
         elif parsed.path == "/api/scan":
             qs = parse_qs(parsed.query)
             folder = unquote(qs.get("path", [""])[0]).strip()
+            recursive = qs.get("recursive", ["0"])[0] == "1"
             if not folder or not os.path.isdir(folder):
                 self._json({"error": f"Папка не найдена: {folder}"}); return
             cfg = load_config()
-            data = build_registry(folder, cfg)
+            data = build_registry(folder, cfg, recursive=recursive)
             self._json(data)
-
         elif parsed.path == "/api/config":
             self._json(load_config())
-
         else:
             self.send_response(404); self.end_headers()
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
-
         if self.path == "/api/save":
             payload = json.loads(body)
             folder = payload.get("path","").strip()
-            rows   = payload.get("rows", [])
+            rows = payload.get("rows", [])
             if not folder or not os.path.isdir(folder):
                 self._json({"error": f"Папка не найдена: {folder}"}); return
             try:
@@ -682,7 +800,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"output_path": out})
             except Exception as e:
                 self._json({"error": str(e)})
-
         elif self.path == "/api/config":
             try:
                 cfg = json.loads(body)
@@ -690,11 +807,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True})
             except Exception as e:
                 self._json({"error": str(e)})
-
         elif self.path == "/api/config/reset":
             save_config(DEFAULT_CONFIG)
             self._json(DEFAULT_CONFIG)
-
         else:
             self.send_response(404); self.end_headers()
 
@@ -714,20 +829,19 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-
 # ─── CLI mode ─────────────────────────────────────────────────────────────────
 
 def run_cli_mode():
     folder = os.path.dirname(os.path.abspath(__file__))
+    recursive = "--recursive" in __import__("sys").argv
     cfg = load_config()
-    data = build_registry(folder, cfg)
+    data = build_registry(folder, cfg, recursive=recursive)
     for e in data["errors"]:
         print(f"[ERROR] {e['file']}: {e['error']}")
     for r in data["rows"]:
         print(f"[OK] {r['_file']}")
     out = save_registry_xlsx(folder, data["rows"], cfg)
     print(f"\n✅ Реестр сформирован: {out}")
-
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
@@ -740,8 +854,9 @@ if __name__ == "__main__":
         server = HTTPServer(("127.0.0.1", PORT), Handler)
         url = f"http://127.0.0.1:{PORT}"
         print(f"✅ Сервер запущен: {url}")
-        print("   Остановить: Ctrl+C")
-        print("   CLI-режим:  python registry_app.py --cli")
+        print(" Остановить: Ctrl+C")
+        print(" CLI-режим: python registry_app.py --cli")
+        print(" CLI с вложенными папками: python registry_app.py --cli --recursive")
         threading.Timer(1.2, lambda: webbrowser.open(url)).start()
         try:
             server.serve_forever()
